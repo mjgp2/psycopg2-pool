@@ -37,7 +37,7 @@ class PoolTests(TestCase):
         pool.putconn(conn)
         assert conn in pool.idle_connections
 
-    def test_putconn_opens_new_connection_to_comply_with_minconn(self):
+    def test_putconn_with_close_connection(self):
         pool = ConnectionPool(1, 1, idle_timeout=0)
         conn = pool.getconn()
         assert conn not in pool.idle_connections
@@ -50,7 +50,21 @@ class PoolTests(TestCase):
         assert conn not in pool.idle_connections
 
         # But we should still have *a* connection available
-        assert len(pool.idle_connections) == 1
+        assert len(pool.idle_connections) == 0
+
+    def test_putconn_with_expired_connection(self):
+        pool = ConnectionPool(1, 1, idle_timeout=60, lifetime_timeout=0)
+        conn = pool.getconn()
+        assert conn not in pool.idle_connections
+        assert len(pool.idle_connections) == 0
+
+        pool.putconn(conn)
+
+        # This connection shouldn't be put in the idle queue because it's closed
+        assert conn not in pool.idle_connections
+
+        # But we should still have *a* connection available
+        assert len(pool.idle_connections) == 0
 
     def test_getconn_closed(self):
         pool = ConnectionPool(0, 1)
