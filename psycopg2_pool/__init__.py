@@ -68,9 +68,9 @@ class ConnectionPool:
         How many seconds to use a connection for before closing it, approximately.
 
         Default 86400.
-        
+
         Recommended to set to 300 for read replicas with DNS load balancing for even
-        load following scale-up. 
+        load following scale-up.
 
     .. attribute:: reap_idle_interval
 
