@@ -7,7 +7,7 @@ import psycopg2
 from psycopg2.errors import ProgrammingError
 import psycopg2.extensions as _ext
 
-from psycopg2_pool import ConnectionPool, PoolError
+from psycopg2_pool import ConnectionPool, PoolError, PoolStats
 
 
 class PoolTests(TestCase):
@@ -18,6 +18,8 @@ class PoolTests(TestCase):
 
         # Make sure we got an open connection
         assert not conn.closed
+
+        assert pool.stats() == PoolStats(1, 0)
 
         # Try again. We should get an error, since we only allowed one connection.
         with self.assertRaises(PoolError):
@@ -184,6 +186,7 @@ class PoolTests(TestCase):
         conn3 = pool.getconn()
 
         assert conn2 != conn3
+        assert pool.stats() == PoolStats(3, 0)
 
         # Verify that we have the expected number of connections to the DB server now
         check_cursor.execute(SQL)
@@ -215,20 +218,22 @@ class PoolTests(TestCase):
         pool = ConnectionPool(0, 10)
         conn1 = pool.getconn()
         conn2 = pool.getconn()
-        pool.putconn(conn2)
+        conn3 = pool.getconn()
+        pool.putconn(conn3)
 
         assert len(pool.connection_queue) == 1
-        assert len(pool.connections_in_use) == 1
+        assert pool.stats() == PoolStats(2, 1)
         assert not conn1.closed
         assert not conn2.closed
+        assert not conn3.closed
 
         pool.clear()
 
-        print(conn2.closed)
-        assert conn2.closed
         assert not conn1.closed
-        assert len(pool.connections_in_use) == 1
+        assert not conn2.closed
+        assert conn3.closed
         assert len(pool.connection_queue) == 0
+        assert pool.stats() == PoolStats(2, 0)
 
     def test_close_if_expired_error(self):
         pool = ConnectionPool(0, 10)

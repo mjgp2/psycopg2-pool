@@ -3,6 +3,7 @@ requires separate TCP connections for concurrent sessions.
 """
 
 import contextlib
+from dataclasses import dataclass
 import logging
 import threading
 from collections import deque
@@ -25,6 +26,12 @@ MESSAGE_WARNING_ROLLBACK = "Transaction being returned in a non-IDLE status, rol
 
 class PoolError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class PoolStats:
+    in_use: int
+    idle: int
 
 
 class ConnectionPool:
@@ -146,6 +153,10 @@ class ConnectionPool:
         except Exception:
             conn.close()
             raise
+
+    def stats(self: Self) -> PoolStats:
+        with self.lock:
+            return PoolStats(len(self.connections_in_use), len(self.connections_idle))
 
     def _checkin_connection(self, conn) -> None:
         now = monotonic()
@@ -329,6 +340,7 @@ class ConnectionPool:
         with self.lock:
             connections = list(self.connection_queue)
             self.connection_queue.clear()
+            self.connections_idle.clear()
         for conn, _ in connections:
             self._safely_close_connection(conn)
 
