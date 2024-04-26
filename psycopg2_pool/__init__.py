@@ -5,12 +5,14 @@ requires separate TCP connections for concurrent sessions.
 import contextlib
 from dataclasses import dataclass
 import logging
+from socket import AF_INET, SOCK_STREAM, getaddrinfo
 import threading
 from collections import deque
-from random import random
+from random import random, shuffle
 from time import monotonic
 from typing import Self
 from weakref import WeakKeyDictionary, WeakSet
+import ipaddress
 
 import psycopg2
 from psycopg2.extensions import connection, TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_UNKNOWN
@@ -28,6 +30,14 @@ class PoolError(Exception):
     pass
 
 
+def is_ip_address(host) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class PoolStats:
     in_use: int
@@ -39,7 +49,7 @@ class ConnectionPool:
 
     .. attribute:: minconn
 
-        The minimum number of connections to keep in the pool. By default one
+        The minimum number of connections to keep warm in the pool. By default one
         connection is opened when the pool is created.
 
     .. attribute:: maxconn
@@ -49,28 +59,44 @@ class ConnectionPool:
 
     .. attribute:: idle_timeout
 
-        How many seconds to keep an idle connection before closing it. The
-        default value causes idle connections to be closed after 10 minutes
-        (approximately, it depends on :meth:`putconn` being called).
+        How many seconds to keep an idle connection before closing it, approximately.
+
+        Default 300.
 
     .. attribute:: lifetime_timeout
 
-        How many seconds to use a connection for before closing it. The
-        default value causes connections to be closed a day after being created
-        (approximately, it depends on :meth:`putconn` being called, plus jitter).
+        How many seconds to use a connection for before closing it, approximately.
+
+        Default 86400.
+        
+        Recommended to set to 300 for read replicas with DNS load balancing for even
+        load following scale-up. 
 
     .. attribute:: reap_idle_interval
 
         How often in seconds to reap the idle connections. Set to zero to disable.
 
+        Default 300.
+
     .. attribute:: test_on_borrow
 
         If turned on, we will issue a `SELECT 1` to check the connection on borrow.
+
+        Default on.
+
+    .. attribute:: background_prewarm
+
+        If turned on, do not block use until minconn connections are reached.
+
+        Default on.
 
     .. attribute:: connect_kwargs
 
         The keyword arguments to pass to :func:`psycopg2.connect`. If the `dsn`
         argument isn't specified, then it's set to an empty string by default.
+
+        If `connect_timeout` is not set, it will be set at 5 seconds to stop the pool
+        locking up if there is an issue with DNS propogation for a host.
 
     The following attributes are internal, they're documented here to provide
     insight into how the pool works.
@@ -94,17 +120,18 @@ class ConnectionPool:
         'minconn', 'maxconn', 'idle_timeout', 'connect_kwargs',
         'connection_queue', 'connections_idle', 'connections_in_use',
         'expiry_times', 'lifetime_timeout', 'reaper_job',
-        '__dict__', 'lock', 'test_on_borrow',
+        '__dict__', 'lock', 'test_on_borrow', 'hostname', 'reap_idle_interval',
     )
 
     def __init__(
                 self: Self,
                 minconn: int = 1,
                 maxconn: float = float('inf'),
-                idle_timeout: int = 600,
-                reap_idle_interval: int = 0,
+                idle_timeout: int = 300,
+                reap_idle_interval: float = 300,
                 lifetime_timeout: int = 86400,
                 test_on_borrow: bool = True,
+                background_prewarm: bool = True,
                 **connect_kwargs
             ) -> None:
         self.minconn: int = minconn
@@ -119,36 +146,64 @@ class ConnectionPool:
             self.reaper_job.start()
         self.test_on_borrow: bool = test_on_borrow
         connect_kwargs.setdefault('dsn', '')
+        connect_kwargs.setdefault('connect_timeout', 5)
         self.connect_kwargs = connect_kwargs
         self.lock: threading.RLock = threading.RLock()
-
+        self.hostname = (
+                str(connect_kwargs['host'])
+                if 'host' in connect_kwargs and not is_ip_address(connect_kwargs['host'])
+                else None
+            )
         self.connections_in_use: WeakSet[connection] = WeakSet()
         self.connections_idle: WeakSet[connection] = WeakSet()
 
         self.connection_queue: deque[tuple[connection, float]] = deque()
         self.expiry_times: WeakKeyDictionary[connection, float] = WeakKeyDictionary()
 
-        for _ in range(self.minconn):
-            self._connect()
+        if self.minconn:
+            if background_prewarm:
+                threading.Thread(target=self.prewarm).start()
+            else:
+                self.prewarm()
+
+    def prewarm(self: Self) -> None:
+        try:
+            while True:
+                stats = self.stats()
+                if stats.idle + stats.in_use >= self.minconn:
+                    break
+                self.putconn(self.getconn())
+        except Exception:
+            logger.exception("Error prewarming pool")
 
     def shutdown(self: Self) -> None:
         self.reaper_job.cancel()
 
-    def _connect(self: Self, for_immediate_use=False) -> connection:
+    def get_shuffled_hostaddr(self: Self) -> list[str] | None:
+        """Resolve DNS and return a list of IP addresses."""
+        if not self.hostname:
+            return None
+        ips = [ip[4][0] for ip in getaddrinfo(self.hostname, 0, AF_INET, SOCK_STREAM)]
+        shuffle(ips)
+        return ips
+
+    def _connect(self: Self, extra_args: dict | None) -> connection:
         """Open a new connection.
         """
-        conn = psycopg2.connect(**self.connect_kwargs)
+        if extra_args:
+            args = self.connect_kwargs | extra_args
+        else:
+            args = self.connect_kwargs
+
+        conn = psycopg2.connect(**args)
         try:
             now = monotonic()
             with self.lock:
-                if for_immediate_use:
-                    self.connections_in_use.add(conn)
-                else:
-                    self._checkin_connection(conn)
                 self.expiry_times[conn] = (
                         now +
                         self.lifetime_timeout * (0.9 + 0.2 * random())
                     )
+                self.connections_in_use.add(conn)
             return conn
         except Exception:
             conn.close()
@@ -181,8 +236,6 @@ class ConnectionPool:
             with self.lock:
                 # the "longest idle" connection
                 conn, return_time = self.connection_queue[0]
-                print(return_time, monotonic(), self.idle_timeout)
-                print(return_time < (monotonic() - self.idle_timeout))
                 if return_time < (monotonic() - self.idle_timeout):
                     self._safely_close_connection(conn)
                     popped, return_time = self.connection_queue.pop()
@@ -218,18 +271,26 @@ class ConnectionPool:
         Any connection that is broken, or has been idle for more than
         :attr:`.idle_timeout` seconds, is closed and discarded.
         """
-        attempts = 0
+
         max_attempts = max(self.minconn, 1)
 
+        ips = self.get_shuffled_hostaddr()
         # even if all the connections are broken in the pool, the max number of idle connections
         # in the deque would be minconn
-        while attempts <= max_attempts:
+        for _ in range(max_attempts+1):
             conn = self._checkout_connection()
             if conn is None:
                 # We don't have any idle connection available, open a new one.
                 if len(self.connections_in_use) >= self.maxconn:
                     raise PoolError("connection pool exhausted")
-                return self._connect(for_immediate_use=True)
+                try:
+                    ip = ips.pop() if ips else None
+                    return self._connect(extra_args={"hostaddr": ip} if ip else None)
+                except Exception:
+                    logger.warning("Failed to connect (hostaddr=%s)", ip)
+                    if ips:
+                        continue
+                    raise
             # validate connection is in a good state
             if self.test_on_borrow:
                 self._do_select_1(conn)
@@ -239,7 +300,6 @@ class ConnectionPool:
             # connection in an invalid state
             logger.warning(MESSAGE_WARNING_CLODING_CONNECTION_WRONG_STATE, status)
             self._evict_connection(conn)
-            attempts += 1
 
         raise PoolError(f"Could not acquire a connection after {self.minconn} tries")
 
