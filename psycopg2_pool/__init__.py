@@ -272,25 +272,31 @@ class ConnectionPool:
         :attr:`.idle_timeout` seconds, is closed and discarded.
         """
 
-        max_attempts = max(self.minconn, 1)
 
-        ips = self.get_shuffled_hostaddr()
+        ips: list[str] | None = None
         # even if all the connections are broken in the pool, the max number of idle connections
         # in the deque would be minconn
-        for _ in range(max_attempts+1):
+        max_dequeues = max(self.minconn, 1) + 1
+        dequeues = 0
+        while dequeues < max_dequeues:
             conn = self._checkout_connection()
             if conn is None:
                 # We don't have any idle connection available, open a new one.
                 if len(self.connections_in_use) >= self.maxconn:
                     raise PoolError("connection pool exhausted")
-                try:
-                    ip = ips.pop() if ips else None
-                    return self._connect(extra_args={"hostaddr": ip} if ip else None)
-                except Exception:
-                    logger.warning("Failed to connect (hostaddr=%s)", ip)
-                    if ips:
-                        continue
-                    raise
+
+                # lazy resolve the IPs that we will try against
+                if ips is None:
+                    ips = self.get_shuffled_hostaddr()
+
+                new_conn = self._attempt_connection(ips)
+
+                if new_conn:
+                    return new_conn
+
+                continue
+
+            dequeues += 1
             # validate connection is in a good state
             if self.test_on_borrow:
                 self._do_select_1(conn)
@@ -302,6 +308,16 @@ class ConnectionPool:
             self._evict_connection(conn)
 
         raise PoolError(f"Could not acquire a connection after {self.minconn} tries")
+
+    def _attempt_connection(self, ips) -> connection | None:
+        ip = ips.pop() if ips else None
+        try:
+            return self._connect(extra_args={"hostaddr": ip} if ip else None)
+        except Exception:
+            logger.warning("Failed to connect (hostaddr=%s)", ip)
+            # If we've run out of IP addresses to try, raise the exception
+            if not ips:
+                raise
 
     def _do_select_1(self: Self, conn: connection):
         try:
