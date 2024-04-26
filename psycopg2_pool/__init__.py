@@ -141,8 +141,9 @@ class ConnectionPool:
         if reap_idle_interval > 0:
             self.reaper_job = threading.Timer(
                 reap_idle_interval,
-                self.reap_idle_connections
+                self.reap_idle_connections,
             )
+            self.reaper_job.daemon = True
             self.reaper_job.start()
         self.test_on_borrow: bool = test_on_borrow
         connect_kwargs.setdefault('dsn', '')
@@ -162,7 +163,9 @@ class ConnectionPool:
 
         if self.minconn:
             if background_prewarm:
-                threading.Thread(target=self.prewarm).start()
+                thread = threading.Thread(target=self.prewarm)
+                thread.daemon = True
+                thread.start()
             else:
                 self.prewarm()
 
