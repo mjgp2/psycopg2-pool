@@ -1,7 +1,9 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from time import monotonic
 from unittest import TestCase
 
+import psycopg2
 from psycopg2.errors import ProgrammingError
 import psycopg2.extensions as _ext
 
@@ -22,80 +24,106 @@ class PoolTests(TestCase):
             pool.getconn()
 
         # Put the connection back, the return time should be saved
+        now = monotonic()
         pool.putconn(conn)
-        assert conn in pool.return_times
+        assert len(pool.connection_queue) == 1
+        assert conn is pool.connection_queue[0][0]
+        assert now < pool.connection_queue[0][1]
 
         # Get the connection back
         new_conn = pool.getconn()
         assert new_conn is conn
+        assert len(pool.connection_queue) == 0
 
     def test_putconn(self):
         pool = ConnectionPool(0, 1)
         conn = pool.getconn()
-        assert conn not in pool.idle_connections
+        assert len(pool.connection_queue) == 0
 
         pool.putconn(conn)
-        assert conn in pool.idle_connections
+        with self.assertRaises(PoolError):
+            pool.putconn(conn)
+
+    def test_putconn_twice(self):
+        pool = ConnectionPool(0, 1)
+        conn = pool.getconn()
+        assert len(pool.connection_queue) == 0
+
+        now = monotonic()
+        pool.putconn(conn)
+        assert len(pool.connection_queue) == 1
+        assert conn is pool.connection_queue[0][0]
+        assert now < pool.connection_queue[0][1]
 
     def test_putconn_with_close_connection(self):
         pool = ConnectionPool(1, 1, idle_timeout=0)
         conn = pool.getconn()
-        assert conn not in pool.idle_connections
-        assert len(pool.idle_connections) == 0
+        assert len(pool.connection_queue) == 0
+        assert conn in pool.connections_in_use
 
         conn.close()
         pool.putconn(conn)
-
-        # This connection shouldn't be put in the idle queue because it's closed
-        assert conn not in pool.idle_connections
-
-        # But we should still have *a* connection available
-        assert len(pool.idle_connections) == 0
+        assert len(pool.connection_queue) == 0
 
     def test_putconn_with_expired_connection(self):
         pool = ConnectionPool(1, 1, idle_timeout=60, lifetime_timeout=0)
         conn = pool.getconn()
-        assert conn not in pool.idle_connections
-        assert len(pool.idle_connections) == 0
+        assert len(pool.connection_queue) == 0
+        assert conn in pool.connections_in_use
 
         pool.putconn(conn)
 
-        # This connection shouldn't be put in the idle queue because it's closed
-        assert conn not in pool.idle_connections
+        assert len(pool.connection_queue) == 0
 
-        # But we should still have *a* connection available
-        assert len(pool.idle_connections) == 0
-
-    def test_getconn_closed(self):
-        pool = ConnectionPool(0, 1)
+    def test_getconn_closed_no_test_on_borrow(self):
+        pool = ConnectionPool(0, 1, test_on_borrow=False)
         conn = pool.getconn()
         pool.putconn(conn)
 
         # Close the connection, it should still be in the pool
         conn.close()
-        assert conn in pool.idle_connections
 
         # The connection should be discarded by getconn
         new_conn = pool.getconn()
         assert new_conn is not conn
-        assert conn not in pool.idle_connections
-        assert conn not in pool.return_times
-        assert conn.closed
 
-    def test_getconn_expired(self):
+    def test_getconn_closed(self):
+        pool = ConnectionPool(0, 1)
+        conn = pool.getconn()
+        now = monotonic()
+        pool.putconn(conn)
+
+        # Close the connection, it should still be in the pool
+        conn.close()
+        assert len(pool.connection_queue) == 1
+        assert conn is pool.connection_queue[0][0]
+        assert now < pool.connection_queue[0][1]
+
+        # The connection should be discarded by getconn
+        new_conn = pool.getconn()
+        assert new_conn is not conn
+
+    def test_reap_idle_connections(self):
         pool = ConnectionPool(0, 1, idle_timeout=30)
         conn = pool.getconn()
 
         # Expire the connection
         pool.putconn(conn)
-        pool.return_times[conn] -= 60
+
+        assert len(pool.connection_queue) == 1
+        assert conn is pool.connection_queue[0][0]
+
+        pool.connection_queue[0] = (pool.connection_queue[0][0], pool.connection_queue[0][1] - 60)
+
+        pool.reap_idle_connections()
 
         # Connection should be discarded
         new_conn = pool.getconn()
         assert new_conn is not conn
-        assert conn not in pool.idle_connections
-        assert conn not in pool.return_times
-        assert conn.closed
+
+        # simulate race condition
+        assert len(pool.connection_queue) == 0
+        assert not pool._reap_connection_idle_too_long()
 
     def test_putconn_errorState(self):
         pool = ConnectionPool(0, 1)
@@ -114,7 +142,7 @@ class PoolTests(TestCase):
 
         # Make sure we got back into the pool and are now showing idle
         assert conn.get_transaction_status() == _ext.TRANSACTION_STATUS_IDLE
-        assert conn in pool.idle_connections
+        assert conn is pool.connection_queue[0][0]
 
     def test_putconn_closed(self):
         pool = ConnectionPool(0, 1)
@@ -122,7 +150,6 @@ class PoolTests(TestCase):
 
         # The connection should be open and shouldn't have a return time
         assert not conn.closed
-        assert conn not in pool.return_times
 
         conn.close()
 
@@ -131,9 +158,7 @@ class PoolTests(TestCase):
 
         pool.putconn(conn)
 
-        # The connection should have been discarded
-        assert conn not in pool.idle_connections
-        assert conn not in pool.return_times
+        assert len(pool.connection_queue) == 0
 
     def test_caching(self):
         pool = ConnectionPool(0, 10)
@@ -152,7 +177,7 @@ class PoolTests(TestCase):
         check_cursor.execute(SQL)
 
         # Not trying to test anything yet, so hopefully this always works :)
-        starting_conns = check_cursor.fetchone()[0]
+        starting_conns = check_cursor.fetchone()[0]  # type: ignore
 
         # Get a couple more connections
         conn2 = pool.getconn()
@@ -162,7 +187,7 @@ class PoolTests(TestCase):
 
         # Verify that we have the expected number of connections to the DB server now
         check_cursor.execute(SQL)
-        total_cons = check_cursor.fetchone()[0]
+        total_cons = check_cursor.fetchone()[0]  # type: ignore
 
         assert total_cons == starting_conns + 2
 
@@ -171,7 +196,7 @@ class PoolTests(TestCase):
         pool.putconn(conn3)
 
         check_cursor.execute(SQL)
-        total_cons_after_put = check_cursor.fetchone()[0]
+        total_cons_after_put = check_cursor.fetchone()[0]  # type: ignore
 
         assert total_cons == total_cons_after_put
 
@@ -182,37 +207,9 @@ class PoolTests(TestCase):
         assert conn4 in (conn2, conn3)
 
         check_cursor.execute(SQL)
-        total_cons_after_get = check_cursor.fetchone()[0]
+        total_cons_after_get = check_cursor.fetchone()[0]  # type: ignore
 
         assert total_cons_after_get == total_cons
-
-    def test_extraneous_connections_are_discarded(self):
-        pool = ConnectionPool(minconn=0, idle_timeout=120)
-        # Get multiple connections then put them all back
-        conns = [pool.getconn() for i in range(3)]
-        for conn in conns:
-            pool.putconn(conn)
-        # Simulate 1 minute passing
-        for conn in conns:
-            pool.return_times[conn] -= 60
-        # Check out one connection multiple times, we should always get the same one
-        last_conn = conns[-1]
-        for i in range(len(conns)):
-            conn = pool.getconn()
-            assert conn is last_conn
-            pool.putconn(conn)
-        # Simulate another minute passing
-        for conn in conns:
-            pool.return_times[conn] -= 60
-        # Get a connection then return it, the other connections should be
-        # discarded by `putconn` because they're too old now
-        conn = pool.getconn()
-        assert conn is last_conn
-        assert list(pool.idle_connections) == conns[:2]
-        assert set(pool.return_times) == set(conns[:2])
-        pool.putconn(conn)
-        assert list(pool.idle_connections) == [conn]
-        assert set(pool.return_times) == set([conn])
 
     def test_clear(self):
         pool = ConnectionPool(0, 10)
@@ -220,15 +217,25 @@ class PoolTests(TestCase):
         conn2 = pool.getconn()
         pool.putconn(conn2)
 
-        assert len(pool.idle_connections) == 1
+        assert len(pool.connection_queue) == 1
         assert len(pool.connections_in_use) == 1
         assert not conn1.closed
         assert not conn2.closed
 
         pool.clear()
 
+        print(conn2.closed)
         assert conn2.closed
         assert not conn1.closed
         assert len(pool.connections_in_use) == 1
-        assert len(pool.idle_connections) == 0
-        assert len(pool.return_times) == 0
+        assert len(pool.connection_queue) == 0
+
+    def test_close_if_expired_error(self):
+        pool = ConnectionPool(0, 10)
+        assert not pool._close_if_expired(('not a connection',))  # type: ignore
+
+    def test_close_if_expired_missing_from_map(self):
+        pool = ConnectionPool(0, 10)
+        conn = psycopg2.connect()
+        assert not pool._close_if_expired(conn)  # type: ignore
+        assert conn.closed

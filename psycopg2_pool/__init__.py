@@ -2,17 +2,25 @@
 requires separate TCP connections for concurrent sessions.
 """
 
-from collections import deque
+import contextlib
 import logging
+import threading
+from collections import deque
 from random import random
-from time import monotonic, perf_counter as uptime
+from time import monotonic
 from typing import Self
 from weakref import WeakKeyDictionary, WeakSet
 
 import psycopg2
-from psycopg2 import extensions as _ext
+from psycopg2.extensions import connection, TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_UNKNOWN
 
 logger = logging.getLogger(__name__)
+
+MESSAGE_WARNING_CLODING_CONNECTION_WRONG_STATE = (
+    "Closing checked out connection from pool because status is not IDLE (%s)"
+)
+
+MESSAGE_WARNING_ROLLBACK = "Transaction being returned in a non-IDLE status, rolling back (%s)"
 
 
 class PoolError(Exception):
@@ -41,8 +49,16 @@ class ConnectionPool:
     .. attribute:: lifetime_timeout
 
         How many seconds to use a connection for before closing it. The
-        default value causes connections to be closed 10 minutes after being created
+        default value causes connections to be closed a day after being created
         (approximately, it depends on :meth:`putconn` being called, plus jitter).
+
+    .. attribute:: reap_idle_interval
+
+        How often in seconds to reap the idle connections. Set to zero to disable.
+
+    .. attribute:: test_on_borrow
+
+        If turned on, we will issue a `SELECT 1` to check the connection on borrow.
 
     .. attribute:: connect_kwargs
 
@@ -62,13 +78,6 @@ class ConnectionPool:
         The pool of unused connections, last in first out.
         Type: :class:`collections.deque`.
 
-    .. attribute:: return_times
-
-        A timestamp is stored in this dict when a connection is added to
-        :attr:`.idle_connections`. That timestamp is used in :meth:`getconn` to
-        compute how long the connection stayed idle in the pool.
-        Type: :class:`dict`.
-
     This class provides two main methods (:meth:`getconn` and :meth:`putconn`),
     plus another one that you probably don't need (:meth:`clear`).
 
@@ -76,9 +85,9 @@ class ConnectionPool:
 
     __slots__ = (
         'minconn', 'maxconn', 'idle_timeout', 'connect_kwargs',
-        'idle_connections', 'connections_in_use', 'return_times',
-        'expiry_times', 'lifetime_timeout',
-        '__dict__'
+        'connection_queue', 'connections_idle', 'connections_in_use',
+        'expiry_times', 'lifetime_timeout', 'reaper_job',
+        '__dict__', 'lock', 'test_on_borrow',
     )
 
     def __init__(
@@ -86,37 +95,109 @@ class ConnectionPool:
                 minconn: int = 1,
                 maxconn: float = float('inf'),
                 idle_timeout: int = 600,
-                lifetime_timeout: int = 600,
+                reap_idle_interval: int = 0,
+                lifetime_timeout: int = 86400,
+                test_on_borrow: bool = True,
                 **connect_kwargs
             ) -> None:
-        self.minconn = minconn
-        self.maxconn = maxconn
-        self.idle_timeout = idle_timeout
-        self.lifetime_timeout = lifetime_timeout
+        self.minconn: int = minconn
+        self.maxconn: float = maxconn
+        self.idle_timeout: int = idle_timeout
+        self.lifetime_timeout: int = lifetime_timeout
+        if reap_idle_interval > 0:
+            self.reaper_job = threading.Timer(
+                reap_idle_interval,
+                self.reap_idle_connections
+            )
+            self.reaper_job.start()
+        self.test_on_borrow: bool = test_on_borrow
         connect_kwargs.setdefault('dsn', '')
         self.connect_kwargs = connect_kwargs
+        self.lock: threading.RLock = threading.RLock()
 
-        self.connections_in_use = WeakSet()
-        self.idle_connections = deque()
-        self.expiry_times: WeakKeyDictionary[_ext.connection, float] = WeakKeyDictionary()
-        self.return_times: WeakKeyDictionary[_ext.connection, float] = WeakKeyDictionary()
+        self.connections_in_use: WeakSet[connection] = WeakSet()
+        self.connections_idle: WeakSet[connection] = WeakSet()
+
+        self.connection_queue: deque[tuple[connection, float]] = deque()
+        self.expiry_times: WeakKeyDictionary[connection, float] = WeakKeyDictionary()
 
         for _ in range(self.minconn):
             self._connect()
 
-    def _connect(self: Self, for_immediate_use=False) -> _ext.connection:
+    def shutdown(self: Self) -> None:
+        self.reaper_job.cancel()
+
+    def _connect(self: Self, for_immediate_use=False) -> connection:
         """Open a new connection.
         """
         conn = psycopg2.connect(**self.connect_kwargs)
-        if for_immediate_use:
-            self.connections_in_use.add(conn)
-        else:
-            self.return_times[conn] = uptime()
-            self.idle_connections.append(conn)
-        self.expiry_times[conn] = monotonic() + self.lifetime_timeout * (0.9 + 0.2 * random())
-        return conn
+        try:
+            now = monotonic()
+            with self.lock:
+                if for_immediate_use:
+                    self.connections_in_use.add(conn)
+                else:
+                    self._checkin_connection(conn)
+                self.expiry_times[conn] = (
+                        now +
+                        self.lifetime_timeout * (0.9 + 0.2 * random())
+                    )
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
-    def getconn(self: Self) -> _ext.connection:
+    def _checkin_connection(self, conn) -> None:
+        now = monotonic()
+        with self.lock:
+            if conn in self.connections_idle:
+                raise PoolError("Connection already idle in pool")
+            self.connections_idle.add(conn)
+            self.connection_queue.append((conn, now))
+
+    def _checkout_connection(self) -> connection | None:
+        try:
+            with self.lock:
+                conn, _ = self.connection_queue.pop()
+                self.connections_idle.remove(conn)
+                self.connections_in_use.add(conn)
+                return conn
+        except IndexError:
+            return None
+
+    def _reap_connection_idle_too_long(self) -> bool:
+        try:
+            with self.lock:
+                # the "longest idle" connection
+                conn, return_time = self.connection_queue[0]
+                print(return_time, monotonic(), self.idle_timeout)
+                print(return_time < (monotonic() - self.idle_timeout))
+                if return_time < (monotonic() - self.idle_timeout):
+                    self._safely_close_connection(conn)
+                    popped, return_time = self.connection_queue.pop()
+                    if popped is not conn:
+                        logger.warning("This should NEVER occur: incorrect connection popped")
+                        self.connection_queue.appendleft((popped, return_time))
+                        return False
+                    logger.info("Reaped connection idle too long")
+                    return True
+        except IndexError:
+            pass
+        return False
+
+    def _evict_connection(self: Self, conn: connection) -> None:
+        with self.lock:
+            if conn in self.connections_idle:
+                raise PoolError("Cannot evict idle connection")
+            with contextlib.suppress(KeyError):
+                self.connections_in_use.remove(conn)
+        self._safely_close_connection(conn)
+
+    def _safely_close_connection(self: Self, conn: connection) -> None:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+    def getconn(self: Self) -> connection:
         """Get a connection from the pool.
 
         If there is no idle connection available, then a new one is opened;
@@ -126,29 +207,41 @@ class ConnectionPool:
         Any connection that is broken, or has been idle for more than
         :attr:`.idle_timeout` seconds, is closed and discarded.
         """
-        while True:
-            try:
-                # Attempt to take an idle connection from the pool.
-                conn = self.idle_connections.pop()
-            except IndexError:
+        attempts = 0
+        max_attempts = max(self.minconn, 1)
+
+        # even if all the connections are broken in the pool, the max number of idle connections
+        # in the deque would be minconn
+        while attempts <= max_attempts:
+            conn = self._checkout_connection()
+            if conn is None:
                 # We don't have any idle connection available, open a new one.
                 if len(self.connections_in_use) >= self.maxconn:
                     raise PoolError("connection pool exhausted")
-                conn = self._connect(for_immediate_use=True)
-            else:
-                # Close and discard the connection if it's broken or too old.
-                idle_since = self.return_times.pop(conn, 0)
-                close = (
-                    conn.info.transaction_status != _ext.TRANSACTION_STATUS_IDLE or
-                    self.idle_timeout and idle_since < (uptime() - self.idle_timeout)
-                )
-                if close:
-                    conn.close()
-                    continue
-            break
-        return conn
+                return self._connect(for_immediate_use=True)
+            # validate connection is in a good state
+            if self.test_on_borrow:
+                self._do_select_1(conn)
+            status = conn.info.transaction_status
+            if status == TRANSACTION_STATUS_IDLE:
+                return conn
+            # connection in an invalid state
+            logger.warning(MESSAGE_WARNING_CLODING_CONNECTION_WRONG_STATE, status)
+            self._evict_connection(conn)
+            attempts += 1
 
-    def putconn(self: Self, conn: _ext.connection) -> None:
+        raise PoolError(f"Could not acquire a connection after {self.minconn} tries")
+
+    def _do_select_1(self: Self, conn: connection):
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+        except Exception:
+            # conn.info.transaction_status should now be UNKNOWN
+            logger.exception("Connection failed test-on borrow")
+
+    def putconn(self: Self, conn: connection) -> None:
         """Return a connection to the pool.
 
         You should always return a connection to the pool, even if you've closed
@@ -156,74 +249,64 @@ class ConnectionPool:
         returned by :meth:`getconn`, so they should be garbage collected even if
         you fail to return them.
         """
-        self._close_if_expired(conn)
+        with self.lock:
+            if conn in self.connections_idle:
+                raise PoolError("Connection already idle in pool")
+            if conn not in self.connections_in_use:
+                raise PoolError("Connection not in use in pool")
 
         self.connections_in_use.discard(conn)
 
         # Determine if the connection should be kept or discarded.
-        if self.idle_timeout == 0:
-            if len(self.idle_connections) >= self.minconn:
-                conn.close()
+        # close_surplus_connections_immediately = self.idle_timeout == 0
+        if self.idle_timeout == 0 and len(self.connection_queue) >= self.minconn:
+            conn.close()
         else:
             status = conn.info.transaction_status
-            if status == _ext.TRANSACTION_STATUS_UNKNOWN:
+            if status == TRANSACTION_STATUS_UNKNOWN:
+                logger.warning("Transaction being returned in an UNKNOWN status")
                 # The connection is broken, discard it.
-                conn.close()
-            else:
-                if status != _ext.TRANSACTION_STATUS_IDLE:
-                    # The connection is still in a transaction, roll it back.
-                    conn.rollback()
-                self.return_times[conn] = monotonic()
-                self.idle_connections.append(conn)
+                self._safely_close_connection(conn)
+            elif not self._close_if_expired(conn):
+                try:
+                    if status != TRANSACTION_STATUS_IDLE:
+                        logger.warning(MESSAGE_WARNING_ROLLBACK, status)
+                        # The connection is still in a transaction, roll it back.
+                        conn.rollback()
+                    self._checkin_connection(conn)
+                except Exception:
+                    #  rollback failed, discard it
+                    logger.info("Rollback of connection failed, closing it.")
+                    self._safely_close_connection(conn)
 
-            self.cleanup_idle_connections()
-
-    def cleanup_idle_connections(self: Self) -> None:
+    def reap_idle_connections(self: Self) -> None:
         """Close and discard idle connections in the pool that breached their
         idle timeout.
         """
         if self.idle_timeout == 0:
+            logger.warning("reap_idle_connections should not be called if idle_timeout is zero")
             return
-        # Clean up the idle connections.
-        # We cap the number of iterations to ensure that we don't end up in
-        # an infinite loop.
-        for _ in range(len(self.idle_connections)):
-            try:
-                conn = self.idle_connections[0]
-            except IndexError:
-                break
-            return_time = self.return_times.get(conn)
-            if return_time is None:
-                # The connection's return time is missing, give up.
-                break
-            if return_time >= (monotonic() - self.idle_timeout):
-                # The leftmost connection isn't too old, so we can assume
-                # that the other ones aren't either.
-                break
-            # This connection has been idle too long, attempt to drop it.
-            try:
-                popped_conn = self.idle_connections.popleft()
-            except IndexError:
-                # Another thread removed this connection from the queue.
-                continue
-            if popped_conn == conn:
-                # Okay, we can close and discard this connection.
-                self.return_times.pop(conn, None)
-                conn.close()
-            else:
-                # We got a different connection, put it back.
-                self.idle_connections.appendleft(popped_conn)
 
-    def _close_if_expired(self: Self, conn: _ext.connection) -> None:
+        logger.warning("Cleaning up idle connections")
+        for _ in range(len(self.connection_queue)):
+            if not self._reap_connection_idle_too_long():
+                # nothing in the pool
+                break
+
+    def _close_if_expired(self: Self, conn: connection) -> bool:
         try:
             expiry = self.expiry_times[conn]
             if expiry < monotonic():
-                logger.debug("Closing connection (expired)")
-                conn.close()
+                logger.info("Closing connection as reached it's maximum lifetime")
+                self._safely_close_connection(conn)
+                del self.expiry_times[conn]
+                return True
         except KeyError:
-            logging.warning("Connection not in expiry map")
+            logging.warning("Connection not in expiry map closing it")
+            self._safely_close_connection(conn)
         except Exception:
             logging.exception("Couldn't close connection")
+        return False
 
     def clear(self: Self):
         """Close and discard all idle connections in the pool (regardless of the
@@ -235,42 +318,20 @@ class ConnectionPool:
         *and* you care about closing those extraneous connections during the
         inactivity period. It's up to you to call this method in that case.
 
+        This may cause more connections to be opened as we lock when getting
+        list of connections to close, and then unlock while the connections are
+        iterated through and closed.
+
         Alternatively you may want to run a cron task to `close idle connections
         from the server <https://stackoverflow.com/a/30769511/>`_.
         """
-        for conn in list(self.idle_connections):
-            try:
-                self.idle_connections.remove(conn)
-            except ValueError:
-                continue
-            self.return_times.pop(conn, None)
-            conn.close()
-
-
-class ThreadSafeConnectionPool(ConnectionPool):
-    """
-    This subclass of :class:`ConnectionPool` uses a :class:`threading.RLock`
-    object to ensure that its methods are thread safe.
-    """
-
-    __slots__ = ('lock',)
-
-    def __init__(self, **kwargs):
-        import threading
-        super().__init__(**kwargs)
-        self.lock = threading.RLock()
-
-    def getconn(self):
-        """See :meth:`ConnectionPool.getconn`."""
+        # need a total lock, no new connections should be able to be made
         with self.lock:
-            return super().getconn()
+            connections = list(self.connection_queue)
+            self.connection_queue.clear()
+        for conn, _ in connections:
+            self._safely_close_connection(conn)
 
-    def putconn(self, conn):
-        """See :meth:`ConnectionPool.putconn`."""
-        with self.lock:
-            return super().putconn(conn)
 
-    def clear(self):
-        """See :meth:`ConnectionPool.clear`."""
-        with self.lock:
-            return super().clear()
+# just an alias
+ThreadSafeConnectionPool = ConnectionPool
