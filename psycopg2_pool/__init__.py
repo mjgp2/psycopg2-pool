@@ -19,7 +19,7 @@ from psycopg2.extensions import connection, TRANSACTION_STATUS_IDLE, TRANSACTION
 
 logger = logging.getLogger(__name__)
 
-MESSAGE_WARNING_CLODING_CONNECTION_WRONG_STATE = (
+MESSAGE_WARNING_CLOSING_CONNECTION_WRONG_STATE = (
     "Closing checked out connection from pool because status is not IDLE (%s)"
 )
 
@@ -307,7 +307,7 @@ class ConnectionPool:
             if status == TRANSACTION_STATUS_IDLE:
                 return conn
             # connection in an invalid state
-            logger.warning(MESSAGE_WARNING_CLODING_CONNECTION_WRONG_STATE, status)
+            logger.warning(MESSAGE_WARNING_CLOSING_CONNECTION_WRONG_STATE, status)
             self._evict_connection(conn)
 
         raise PoolError(f"Could not acquire a connection after {self.minconn} tries")
