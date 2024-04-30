@@ -294,12 +294,12 @@ class PoolTests(TestCase):
 
     def test_prewarm(self):
         pool = ConnectionPool(1, 1, background_prewarm=False, reap_idle_interval=0)
-        sleep(2)
         assert pool.stats().idle == 1
         assert pool.prewarmed
 
     def test_prewarm_background(self):
         pool = ConnectionPool(5, 10, reap_idle_interval=0)
+        # TODO: replace this with a polling test
         sleep(3)
         assert pool.stats().idle == 5
         assert pool.prewarmed
