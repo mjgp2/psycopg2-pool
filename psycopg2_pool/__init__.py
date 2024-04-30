@@ -121,6 +121,7 @@ class ConnectionPool:
         'connection_queue', 'connections_idle', 'connections_in_use',
         'expiry_times', 'lifetime_timeout', 'reaper_job',
         '__dict__', 'lock', 'test_on_borrow', 'hostname', 'reap_idle_interval',
+        'prewarmed',
     )
 
     def __init__(
@@ -171,13 +172,15 @@ class ConnectionPool:
 
     def prewarm(self: Self) -> None:
         try:
-            while True:
+            for _ in range(0, self.minconn):
                 stats = self.stats()
                 if stats.idle + stats.in_use >= self.minconn:
                     break
-                self.putconn(self.getconn())
+                self.putconn(self._getconn(False))
         except Exception:
             logger.exception("Error prewarming pool")
+        finally:
+            self.prewarmed = True
 
     def shutdown(self: Self) -> None:
         self.reaper_job.cancel()
@@ -275,14 +278,16 @@ class ConnectionPool:
         :attr:`.idle_timeout` seconds, is closed and discarded.
         """
 
+        return self._getconn()
 
+    def _getconn(self: Self, checkout_connection: bool = True) -> connection:
         ips: list[str] | None = None
         # even if all the connections are broken in the pool, the max number of idle connections
         # in the deque would be minconn
         max_dequeues = max(self.minconn, 1) + 1
         dequeues = 0
         while dequeues < max_dequeues:
-            conn = self._checkout_connection()
+            conn = self._checkout_connection() if checkout_connection else None
             if conn is None:
                 # We don't have any idle connection available, open a new one.
                 if len(self.connections_in_use) >= self.maxconn:
