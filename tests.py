@@ -299,8 +299,11 @@ class PoolTests(TestCase):
 
     def test_prewarm_background(self):
         pool = ConnectionPool(5, 10, reap_idle_interval=0)
-        # TODO: replace this with a polling test
-        sleep(3)
-        assert pool.stats().idle == 5
-        assert pool.prewarmed
+        assert not pool.prewarmed
+        for _ in range(0,100):
+            sleep(0.1)
+            if pool.stats().idle == 5:
+                assert pool.prewarmed
+                return
+        raise Exception("Prewarm failed")
 

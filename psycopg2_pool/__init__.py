@@ -161,7 +161,7 @@ class ConnectionPool:
 
         self.connection_queue: deque[tuple[connection, float]] = deque()
         self.expiry_times: WeakKeyDictionary[connection, float] = WeakKeyDictionary()
-
+        self.prewarmed = False
         if self.minconn:
             if background_prewarm:
                 thread = threading.Thread(target=self.prewarm)
