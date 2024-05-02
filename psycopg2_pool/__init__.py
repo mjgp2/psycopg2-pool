@@ -349,8 +349,11 @@ class ConnectionPool:
                 raise PoolError("Connection already idle in pool")
             if conn not in self.connections_in_use:
                 raise PoolError("Connection not in use in pool")
+            self.connections_in_use.discard(conn)
 
-        self.connections_in_use.discard(conn)
+        # cancel the current command, if one is running
+        # this is a no-op if nothing is running
+        conn.cancel()
 
         # Determine if the connection should be kept or discarded.
         # close_surplus_connections_immediately = self.idle_timeout == 0
