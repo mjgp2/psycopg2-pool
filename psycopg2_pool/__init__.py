@@ -196,6 +196,9 @@ class ConnectionPool:
     def _connect(self: Self, extra_args: dict | None) -> connection:
         """Open a new connection.
         """
+
+        logger.debug("Opening connection")
+
         if extra_args:
             args = self.connect_kwargs | extra_args
         else:
@@ -225,12 +228,14 @@ class ConnectionPool:
             if conn in self.connections_idle:
                 raise PoolError("Connection already idle in pool")
             self.connections_idle.add(conn)
+            # add to the back (right)
             self.connection_queue.append((conn, now))
 
     def _checkout_connection(self) -> connection | None:
         try:
             with self.lock:
-                conn, _ = self.connection_queue.pop()
+                # take from the front (left)
+                conn, _ = self.connection_queue.popleft()
                 self.connections_idle.remove(conn)
                 self.connections_in_use.add(conn)
                 return conn
@@ -240,20 +245,30 @@ class ConnectionPool:
     def _reap_connection_idle_too_long(self) -> bool:
         try:
             with self.lock:
-                # the "longest idle" connection
+                if not self.connection_queue:
+                    return False
+                min_return_time = monotonic() - self.idle_timeout
+                # the "longest idle" connection is at the front
                 conn, return_time = self.connection_queue[0]
-                if return_time < (monotonic() - self.idle_timeout):
-                    self._safely_close_connection(conn)
-                    popped, return_time = self.connection_queue.pop()
-                    if popped is not conn:
-                        logger.warning("This should NEVER occur: incorrect connection popped")
-                        self.connection_queue.appendleft((popped, return_time))
-                        return False
-                    logger.info("Reaped connection idle too long")
-                    return True
+                if return_time > min_return_time:
+                    return False
+
+                # take from the front (left)
+                idle_connection = self._checkout_connection()
+
+                if idle_connection is None:
+                    logger.warning("This should NEVER occur: null connection popped")
+                    return False
+
+                if idle_connection is not conn:
+                    logger.warning("This should NEVER occur: incorrect connection popped, closing anyway")
+
+                self._evict_connection(idle_connection)
+                logger.warning("Reaped connection idle too long, now %s connections", len(self.connection_queue))
+                return True
         except IndexError:
-            pass
-        return False
+            logger.warning("This should NEVER occur: index error")
+            return False
 
     def _evict_connection(self: Self, conn: connection) -> None:
         with self.lock:
@@ -353,7 +368,9 @@ class ConnectionPool:
 
         # cancel the current command, if one is running
         # this is a no-op if nothing is running
-        conn.cancel()
+        if not conn.closed:
+            with contextlib.suppress(Exception):
+                conn.cancel()
 
         # Determine if the connection should be kept or discarded.
         # close_surplus_connections_immediately = self.idle_timeout == 0
@@ -385,11 +402,19 @@ class ConnectionPool:
             logger.warning("reap_idle_connections should not be called if idle_timeout is zero")
             return
 
-        logger.warning("Cleaning up idle connections")
-        for _ in range(len(self.connection_queue)):
+        q_len = len(self.connection_queue)
+        logger.info("Cleaning up idle connections from %s connections in pool", q_len)
+        close_count = 0
+        for _ in range(q_len):
             if not self._reap_connection_idle_too_long():
                 # nothing in the pool
                 break
+            close_count+=1
+    
+        logger.info("Closed %s connections", close_count)
+
+        # create any connections necessary
+        self.prewarm()
 
     def _close_if_expired(self: Self, conn: connection) -> bool:
         try:
@@ -400,10 +425,10 @@ class ConnectionPool:
                 del self.expiry_times[conn]
                 return True
         except KeyError:
-            logging.warning("Connection not in expiry map closing it")
+            logger.warning("Connection not in expiry map closing it")
             self._safely_close_connection(conn)
         except Exception:
-            logging.exception("Couldn't close connection")
+            logger.exception("Couldn't close connection")
         return False
 
     def clear(self: Self):

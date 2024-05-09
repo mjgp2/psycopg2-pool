@@ -113,26 +113,35 @@ class PoolTests(TestCase):
         assert new_conn is not conn
 
     def test_reap_idle_connections(self):
-        pool = ConnectionPool(0, 1, idle_timeout=30, reap_idle_interval=0)
+        pool = ConnectionPool(0, 10, idle_timeout=30, reap_idle_interval=0)
         conn = pool.getconn()
+        conn2 = pool.getconn()
 
         # Expire the connection
         pool.putconn(conn)
+        pool.putconn(conn2)
 
-        assert len(pool.connection_queue) == 1
+        assert pool.stats() == PoolStats(0, 2)
         assert conn is pool.connection_queue[0][0]
 
         pool.connection_queue[0] = (pool.connection_queue[0][0], pool.connection_queue[0][1] - 60)
-
+        print(pool.stats() )
         pool.reap_idle_connections()
+        print(pool.stats() )
+        assert pool.stats() == PoolStats(0, 1)
 
         # Connection should be discarded
         new_conn = pool.getconn()
         assert new_conn is not conn
 
+
         # simulate race condition
         assert len(pool.connection_queue) == 0
-        assert not pool._reap_connection_idle_too_long()
+
+        # make sure reaping keeps the minimum number of connections in the pool 
+        pool.minconn = 2
+        pool.reap_idle_connections()
+        assert pool.stats() == PoolStats(1, 1)
 
     def test_reap_idle_connections_auto(self):
         pool = ConnectionPool(0, 1, idle_timeout=30, reap_idle_interval=0.1)
