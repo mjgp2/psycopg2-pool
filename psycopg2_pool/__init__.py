@@ -10,6 +10,7 @@ import threading
 from collections import deque
 from random import random, shuffle
 from time import monotonic
+import time
 from typing import Self
 from weakref import WeakKeyDictionary, WeakSet
 import ipaddress
@@ -121,7 +122,7 @@ class ConnectionPool:
         'connection_queue', 'connections_idle', 'connections_in_use',
         'expiry_times', 'lifetime_timeout', 'reaper_job',
         '__dict__', 'lock', 'test_on_borrow', 'hostname', 'reap_idle_interval',
-        'prewarmed',
+        'prewarmed', '_shutdown',
     )
 
     def __init__(
@@ -135,17 +136,11 @@ class ConnectionPool:
                 background_prewarm: bool = True,
                 **connect_kwargs
             ) -> None:
+        self._shutdown = False
         self.minconn: int = minconn
         self.maxconn: float = maxconn
         self.idle_timeout: int = idle_timeout
         self.lifetime_timeout: int = lifetime_timeout
-        if reap_idle_interval > 0:
-            self.reaper_job = threading.Timer(
-                reap_idle_interval,
-                self.reap_idle_connections,
-            )
-            self.reaper_job.daemon = True
-            self.reaper_job.start()
         self.test_on_borrow: bool = test_on_borrow
         connect_kwargs.setdefault('dsn', '')
         connect_kwargs.setdefault('connect_timeout', 5)
@@ -170,6 +165,19 @@ class ConnectionPool:
             else:
                 self.prewarm()
 
+        if reap_idle_interval > 0:
+            self.reaper_job = threading.Thread(target = self._reap_loop, args = [reap_idle_interval])
+            self.reaper_job.daemon = True
+            self.reaper_job.start()
+
+    def _reap_loop(self: Self, interval: int) -> None:
+        while not self._shutdown:
+            try:
+                self.reap_idle_connections()
+            except Exception:
+                logging.exception("Unexpected exception from reap_idle_connections")
+            time.sleep(interval)
+
     def prewarm(self: Self) -> None:
         try:
             for _ in range(0, self.minconn):
@@ -183,7 +191,7 @@ class ConnectionPool:
             self.prewarmed = True
 
     def shutdown(self: Self) -> None:
-        self.reaper_job.cancel()
+        self.shutdown = True
 
     def get_shuffled_hostaddr(self: Self) -> list[str] | None:
         """Resolve DNS and return a list of IP addresses."""
