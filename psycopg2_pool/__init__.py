@@ -275,7 +275,7 @@ class ConnectionPool:
                     logger.warning("This should NEVER occur: incorrect connection popped, closing anyway")
 
                 self._evict_connection(idle_connection)
-                logger.warning("Reaped connection idle too long, now %s connections", len(self.connection_queue))
+                logger.info("Reaped connection idle too long, now %s connections", len(self.connection_queue))
                 return True
         except IndexError:
             logger.warning("This should NEVER occur: index error")
