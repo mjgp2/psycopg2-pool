@@ -18,6 +18,16 @@ class PoolTests(TestCase):
         assert pool.connect_kwargs['connect_timeout'] == 5
         assert pool.connect_kwargs['dsn'] == ''
 
+    def test_hostname(self):
+
+        assert ConnectionPool(0, 1, reap_idle_interval=0, host = 'localhost').hostname == 'localhost'
+        assert ConnectionPool(0, 1, reap_idle_interval=0, host = 'localhost', hostaddr='127.0.0.1').hostname is None
+        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'postgresql://test_user:password@localhost/test').hostname == 'localhost'
+        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'postgresql://test_user:password@127.0.0.1/test').hostname is None
+        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'user=test_user password=password dbname=test host=localhost port=5434 connect_timeout=5 hostaddr=127.0.0.1').hostname is None
+        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'user=test_user password=password dbname=test host=localhost port=5434 connect_timeout=5').hostname == 'localhost'
+
+
     def test_getconn(self):
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
 
@@ -315,4 +325,10 @@ class PoolTests(TestCase):
                 assert pool.prewarmed
                 return
         raise Exception("Prewarm failed")
+
+    def test_shutdown(self):
+        pool = ConnectionPool(5, 10, reap_idle_interval=0)
+        assert not pool._shutdown
+        pool.shutdown()
+        assert pool._shutdown
 

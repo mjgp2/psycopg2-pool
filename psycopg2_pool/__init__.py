@@ -13,6 +13,7 @@ from time import monotonic
 import time
 from typing import Self
 from weakref import WeakKeyDictionary, WeakSet
+from psycopg2.extensions import parse_dsn
 import ipaddress
 
 import psycopg2
@@ -146,11 +147,12 @@ class ConnectionPool:
         connect_kwargs.setdefault('connect_timeout', 5)
         self.connect_kwargs = connect_kwargs
         self.lock: threading.RLock = threading.RLock()
-        self.hostname = (
-                str(connect_kwargs['host'])
-                if 'host' in connect_kwargs and not is_ip_address(connect_kwargs['host'])
-                else None
-            )
+
+        parsed_dsn = parse_dsn(connect_kwargs['dsn']) | connect_kwargs
+        host = parsed_dsn['host'] if 'host' in parsed_dsn and 'hostaddr' not in parsed_dsn else None
+
+        self.hostname = str(host) if host and not is_ip_address(host) else None
+            
         self.connections_in_use: WeakSet[connection] = WeakSet()
         self.connections_idle: WeakSet[connection] = WeakSet()
 
@@ -191,7 +193,7 @@ class ConnectionPool:
             self.prewarmed = True
 
     def shutdown(self: Self) -> None:
-        self.shutdown = True
+        self._shutdown = True
 
     def get_shuffled_hostaddr(self: Self) -> list[str] | None:
         """Resolve DNS and return a list of IP addresses."""
@@ -199,18 +201,19 @@ class ConnectionPool:
             return None
         ips = [ip[4][0] for ip in getaddrinfo(self.hostname, 0, AF_INET, SOCK_STREAM)]
         shuffle(ips)
+        logger.debug('Resovled ip addresses for hostname', extra={'ips': ips})
         return ips
 
     def _connect(self: Self, extra_args: dict | None) -> connection:
         """Open a new connection.
         """
 
-        logger.debug("Opening connection")
-
         if extra_args:
             args = self.connect_kwargs | extra_args
         else:
             args = self.connect_kwargs
+
+        logger.debug("Opening connection", extra={"args": args})
 
         conn = psycopg2.connect(**args)
         try:
