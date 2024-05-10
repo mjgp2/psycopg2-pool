@@ -213,7 +213,7 @@ class ConnectionPool:
         else:
             args = self.connect_kwargs
 
-        logger.debug("Opening connection", extra={"args": args})
+        logger.debug("Opening connection", extra={"connect_kwargs": args})
 
         conn = psycopg2.connect(**args)
         try:
