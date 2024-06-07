@@ -1,0 +1,108 @@
+[tool.poetry]
+name = "psycopg2_pool2"
+version = "1.0.0"
+description = "Enterprise pooling of psycopg2 connections"
+authors = ["Matthew Painter", "Changaco"]
+maintainers = ["Matthew Painter"]
+license = "LGPL3"
+readme = "README.md"
+repository = "https://github.com/mjgp2/psycopg2-pool2"
+keywords = [
+    "Flask"
+]
+
+[tool.poetry.dependencies]
+python = "~3.11.4"
+
+[tool.poetry.group.tests.dependencies]
+pytest = "^7.4.0"
+ruff = "^0.4.8"
+mypy = "^1.10.0"
+types-psycopg2 = "^2.9.21.11"
+yapf = "^0.40.2"
+psycopg2 = "^2.9.9"
+pytest-cov = "^5.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pre-commit = "^3.3.3"
+deptry = "^0.12.0"
+ptw = "^1.0.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 180
+lint.select = [  # https://beta.ruff.rs/docs/rules
+  "A",      # flake8-builtins
+  "ARG",    # flake8-unused-arguments
+  "ASYNC",  # flake8-async
+  "B",      # flake8-bugbear
+  "BLE",    # flake8-blind-except
+  "C4",     # flake8-comprehensions
+  "C90",    # McCabe cyclomatic complexity
+  "DTZ",    # flake8-datetimez
+  "E",      # pycodestyle
+  "EM",     # flake8-errmsg
+  "EXE",    # flake8-executable
+  "F",      # Pyflakes
+  "FA",     # flake8-future-annotations
+  "FLY",    # flynt
+  "G",      # flake8-logging-format
+  "I",      # isort
+  "ICN",    # flake8-import-conventions
+  "INP",    # flake8-no-pep420
+  "INT",    # flake8-gettext
+  "N",      # pep8-naming
+  "NPY",    # NumPy-specific rules
+  "PGH",    # pygrep-hooks
+  "PIE",    # flake8-pie
+  "PL",     # Pylint
+  "PYI",    # flake8-pyi
+  "RSE",    # flake8-raise
+  "RUF",    # Ruff-specific rules
+  "S",      # flake8-bandit
+  "SIM",    # flake8-simplify
+  "SLF",    # flake8-self
+  "T10",    # flake8-debugger
+  "TD",     # flake8-todos
+  "TID",    # flake8-tidy-imports
+  "UP",     # pyupgrade
+  "W",      # pycodestyle
+  "YTT",    # flake8-2020
+  "ANN",    # flake8-annotations  
+  "COM",    # flake8-commas
+  "D",      # pydocstyle 
+  "DJ",     # flake8-django
+  "ERA",    # eradicate
+  "FBT",    # flake8-boolean-trap
+  "ISC",    # flake8-implicit-str-concat 
+  "PD",     # pandas-vet
+  "PT",     # flake8-pytest-style
+  "PTH",    # flake8-use-pathlib
+  "Q",      # flake8-quotes
+  "RET",    # flake8-return  
+  "T20",    # flake8-print
+  "TCH",    # flake8-type-checking
+  "TRY",    # tryceratops
+]
+output-format = "full"
+target-version = "py311"
+exclude = [
+  "tests.py",
+  ]
+lint.ignore = [
+  "D203",
+  "D202",
+  "D212",
+  "D407",
+  "PTH123", # pathlib-open - this would force pathlib usage anytime open or with open was used.
+  "C901",
+  "PLR0911",
+  "PD002",
+]
+
+[tool.ruff.lint.isort]
+section-order = ["future", "standard-library", "first-party", "third-party", "local-folder"]
+

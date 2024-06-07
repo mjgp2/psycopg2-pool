@@ -1,53 +1,53 @@
-"""This module implements connection pooling, which is needed because PostgreSQL
-requires separate TCP connections for concurrent sessions.
-"""
+"""Enterprise connection pooling for psycopg2."""
 
 import contextlib
-from dataclasses import dataclass
+import ipaddress
 import logging
-from socket import AF_INET, SOCK_STREAM, getaddrinfo
 import threading
-from collections import deque
-from random import random, shuffle
-from time import monotonic
 import time
+from collections import deque
+from collections.abc import Generator
+from dataclasses import dataclass
+from random import random, shuffle
+from socket import AF_INET, SOCK_STREAM, getaddrinfo
+from time import monotonic
 from typing import Self
 from weakref import WeakKeyDictionary, WeakSet
-from psycopg2.extensions import parse_dsn
-import ipaddress
 
 import psycopg2
-from psycopg2.extensions import connection, TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_UNKNOWN
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_UNKNOWN, connection, parse_dsn
 
 logger = logging.getLogger(__name__)
 
-MESSAGE_WARNING_CLOSING_CONNECTION_WRONG_STATE = (
-    "Closing checked out connection from pool because status is not IDLE (%s)"
-)
+MESSAGE_WARNING_CLOSING_CONNECTION_WRONG_STATE = ("Closing checked out connection from pool because status is not IDLE (%s)")
 
 MESSAGE_WARNING_ROLLBACK = "Transaction being returned in a non-IDLE status, rolling back (%s)"
 
 
 class PoolError(Exception):
-    pass
+    """An error within the pool."""
 
 
-def is_ip_address(host) -> bool:
+def _is_ip_address(host: str) -> bool:
     try:
         ipaddress.ip_address(host)
-        return True
     except ValueError:
         return False
+    else:
+        return True
 
 
 @dataclass(frozen=True)
 class PoolStats:
+    """Pool connection statistics."""
+
     in_use: int
     idle: int
 
 
 class ConnectionPool:
-    """A pool of :class:`psycopg2:connection` objects.
+    """
+    A pool of :class:`psycopg2:connection` objects.
 
     .. attribute:: minconn
 
@@ -119,40 +119,54 @@ class ConnectionPool:
     """
 
     __slots__ = (
-        'minconn', 'maxconn', 'idle_timeout', 'connect_kwargs',
-        'connection_queue', 'connections_idle', 'connections_in_use',
-        'expiry_times', 'lifetime_timeout', 'reaper_job',
-        '__dict__', 'lock', 'test_on_borrow', 'hostname', 'reap_idle_interval',
-        'prewarmed', '_shutdown',
+        "minconn",
+        "maxconn",
+        "idle_timeout",
+        "connect_kwargs",
+        "connection_queue",
+        "connections_idle",
+        "connections_in_use",
+        "expiry_times",
+        "lifetime_timeout",
+        "reaper_job",
+        "__dict__",
+        "lock",
+        "test_on_borrow",
+        "hostname",
+        "reap_idle_interval",
+        "prewarmed",
+        "_shutdown",
     )
 
-    def __init__(
-                self: Self,
-                minconn: int = 1,
-                maxconn: float = float('inf'),
-                idle_timeout: int = 300,
-                reap_idle_interval: float = 300,
-                lifetime_timeout: int = 86400,
-                test_on_borrow: bool = True,
-                background_prewarm: bool = True,
-                **connect_kwargs
-            ) -> None:
+    def __init__(  # noqa: PLR0913
+        self: Self,
+        minconn: int = 1,
+        maxconn: float = float("inf"),
+        idle_timeout: int = 300,
+        reap_idle_interval: float = 300,
+        lifetime_timeout: int = 86400,
+        *,
+        test_on_borrow: bool = True,
+        background_prewarm: bool = True,
+        **connect_kwargs,  # noqa: ANN003
+    ) -> None:
+        """Initialize a pool."""
         self._shutdown = False
         self.minconn: int = minconn
         self.maxconn: float = maxconn
         self.idle_timeout: int = idle_timeout
         self.lifetime_timeout: int = lifetime_timeout
         self.test_on_borrow: bool = test_on_borrow
-        connect_kwargs.setdefault('dsn', '')
-        connect_kwargs.setdefault('connect_timeout', 5)
+        connect_kwargs.setdefault("dsn", "")
+        connect_kwargs.setdefault("connect_timeout", 5)
         self.connect_kwargs = connect_kwargs
         self.lock: threading.RLock = threading.RLock()
 
-        parsed_dsn = parse_dsn(connect_kwargs['dsn']) | connect_kwargs
-        host = parsed_dsn['host'] if 'host' in parsed_dsn and 'hostaddr' not in parsed_dsn else None
+        parsed_dsn = parse_dsn(connect_kwargs["dsn"]) | connect_kwargs
+        host = parsed_dsn["host"] if "host" in parsed_dsn and "hostaddr" not in parsed_dsn else None
 
-        self.hostname = str(host) if host and not is_ip_address(host) else None
-            
+        self.hostname = str(host) if host and not _is_ip_address(host) else None
+
         self.connections_in_use: WeakSet[connection] = WeakSet()
         self.connections_idle: WeakSet[connection] = WeakSet()
 
@@ -161,14 +175,14 @@ class ConnectionPool:
         self.prewarmed = False
         if self.minconn:
             if background_prewarm:
-                thread = threading.Thread(target=self.prewarm)
+                thread = threading.Thread(target=self._prewarm_loop, args=[60])
                 thread.daemon = True
                 thread.start()
             else:
-                self.prewarm()
+                self._prewarm()
 
         if reap_idle_interval > 0:
-            self.reaper_job = threading.Thread(target = self._reap_loop, args = [reap_idle_interval])
+            self.reaper_job = threading.Thread(target=self._reap_loop, args=[reap_idle_interval])
             self.reaper_job.daemon = True
             self.reaper_job.start()
 
@@ -180,38 +194,43 @@ class ConnectionPool:
                 logging.exception("Unexpected exception from reap_idle_connections")
             time.sleep(interval)
 
-    def prewarm(self: Self) -> None:
+    def _prewarm_loop(self: Self, interval: int) -> None:
+        while not self._shutdown:
+            try:
+                self._prewarm()
+            except Exception:
+                logging.exception("Unexpected exception from _prewarm")
+            time.sleep(interval)
+
+    def _prewarm(self: Self) -> None:
         try:
-            for _ in range(0, self.minconn):
+            for _ in range(self.minconn):
                 stats = self.stats()
                 if stats.idle + stats.in_use >= self.minconn:
                     break
-                self.putconn(self._getconn(False))
+                self.putconn(self._getconn(checkout_connection=False))
         except Exception:
             logger.exception("Error prewarming pool")
         finally:
             self.prewarmed = True
 
     def shutdown(self: Self) -> None:
+        """Shutdown this pool, stopping any spawned threads."""
         self._shutdown = True
 
-    def get_shuffled_hostaddr(self: Self) -> list[str] | None:
+    def _get_shuffled_hostaddr(self: Self) -> deque[str] | None:
         """Resolve DNS and return a list of IP addresses."""
         if not self.hostname:
             return None
         ips = [ip[4][0] for ip in getaddrinfo(self.hostname, 0, AF_INET, SOCK_STREAM)]
         shuffle(ips)
-        logger.debug('Resovled ip addresses for hostname', extra={'ips': ips})
-        return ips
+        logger.debug("Resovled ip addresses for hostname", extra={"ips": ips})
+        return deque(ips)
 
     def _connect(self: Self, extra_args: dict | None) -> connection:
-        """Open a new connection.
-        """
+        """Open a new connection."""
 
-        if extra_args:
-            args = self.connect_kwargs | extra_args
-        else:
-            args = self.connect_kwargs
+        args = self.connect_kwargs | extra_args if extra_args else self.connect_kwargs
 
         logger.debug("Opening connection", extra={"connect_kwargs": args})
 
@@ -219,30 +238,30 @@ class ConnectionPool:
         try:
             now = monotonic()
             with self.lock:
-                self.expiry_times[conn] = (
-                        now +
-                        self.lifetime_timeout * (0.9 + 0.2 * random())
-                    )
+                self.expiry_times[conn] = (now + self.lifetime_timeout * (0.9 + 0.2 * random()))  # noqa: S311
                 self.connections_in_use.add(conn)
-            return conn
         except Exception:
             conn.close()
             raise
+        else:
+            return conn
 
     def stats(self: Self) -> PoolStats:
+        """Return statistics on pool usage."""
         with self.lock:
             return PoolStats(len(self.connections_in_use), len(self.connections_idle))
 
-    def _checkin_connection(self, conn) -> None:
+    def _checkin_connection(self: Self, conn: connection) -> None:
         now = monotonic()
         with self.lock:
             if conn in self.connections_idle:
-                raise PoolError("Connection already idle in pool")
+                msg = "Connection already idle in pool"
+                raise PoolError(msg)
             self.connections_idle.add(conn)
             # add to the back (right)
             self.connection_queue.append((conn, now))
 
-    def _checkout_connection(self) -> connection | None:
+    def _checkout_connection(self: Self) -> connection | None:
         try:
             with self.lock:
                 # take from the front (left)
@@ -253,7 +272,7 @@ class ConnectionPool:
         except IndexError:
             return None
 
-    def _reap_connection_idle_too_long(self) -> bool:
+    def _reap_connection_idle_too_long(self: Self) -> bool:
         try:
             with self.lock:
                 if not self.connection_queue:
@@ -284,7 +303,8 @@ class ConnectionPool:
     def _evict_connection(self: Self, conn: connection) -> None:
         with self.lock:
             if conn in self.connections_idle:
-                raise PoolError("Cannot evict idle connection")
+                msg = "Cannot evict idle connection"
+                raise PoolError(msg)
             with contextlib.suppress(KeyError):
                 self.connections_in_use.remove(conn)
         self._safely_close_connection(conn)
@@ -293,21 +313,28 @@ class ConnectionPool:
         with contextlib.suppress(Exception):
             conn.close()
 
+    @contextlib.contextmanager
+    def conn(self: Self) -> Generator[connection, None, None]:
+        """Yield a connection, and return it when the context manager completes."""
+
+        conn = self._getconn()
+        try:
+            yield conn
+        finally:
+            self.putconn(conn)
+
     def getconn(self: Self) -> connection:
-        """Get a connection from the pool.
+        """
+        Get a tested connection from the pool.
 
         If there is no idle connection available, then a new one is opened;
         unless there are already :attr:`.maxconn` connections open, then a
         :class:`PoolError` exception is raised.
-
-        Any connection that is broken, or has been idle for more than
-        :attr:`.idle_timeout` seconds, is closed and discarded.
         """
-
         return self._getconn()
 
-    def _getconn(self: Self, checkout_connection: bool = True) -> connection:
-        ips: list[str] | None = None
+    def _getconn(self: Self, *, checkout_connection: bool = True) -> connection:
+        ips: deque[str] | None = None
         # even if all the connections are broken in the pool, the max number of idle connections
         # in the deque would be minconn
         max_dequeues = max(self.minconn, 1) + 1
@@ -317,11 +344,12 @@ class ConnectionPool:
             if conn is None:
                 # We don't have any idle connection available, open a new one.
                 if len(self.connections_in_use) >= self.maxconn:
-                    raise PoolError("connection pool exhausted")
+                    msg = "connection pool exhausted"
+                    raise PoolError(msg)
 
                 # lazy resolve the IPs that we will try against
                 if ips is None:
-                    ips = self.get_shuffled_hostaddr()
+                    ips = self._get_shuffled_hostaddr()
 
                 new_conn = self._attempt_connection(ips)
 
@@ -341,9 +369,10 @@ class ConnectionPool:
             logger.warning(MESSAGE_WARNING_CLOSING_CONNECTION_WRONG_STATE, status)
             self._evict_connection(conn)
 
-        raise PoolError(f"Could not acquire a connection after {self.minconn} tries")
+        msg = f"Could not acquire a connection after {max_dequeues} tries"
+        raise PoolError(msg)
 
-    def _attempt_connection(self, ips) -> connection | None:
+    def _attempt_connection(self: Self, ips: deque[str] | None) -> connection | None:
         ip = ips.pop() if ips else None
         try:
             return self._connect(extra_args={"hostaddr": ip} if ip else None)
@@ -352,8 +381,9 @@ class ConnectionPool:
             # If we've run out of IP addresses to try, raise the exception
             if not ips:
                 raise
+            return None
 
-    def _do_select_1(self: Self, conn: connection):
+    def _do_select_1(self: Self, conn: connection) -> None:
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -363,7 +393,8 @@ class ConnectionPool:
             logger.exception("Connection failed test-on borrow")
 
     def putconn(self: Self, conn: connection) -> None:
-        """Return a connection to the pool.
+        """
+        Return a connection to the pool.
 
         You should always return a connection to the pool, even if you've closed
         it. That being said, the pool only holds weak references to connections
@@ -372,9 +403,11 @@ class ConnectionPool:
         """
         with self.lock:
             if conn in self.connections_idle:
-                raise PoolError("Connection already idle in pool")
+                msg = "Connection already idle in pool"
+                raise PoolError(msg)
             if conn not in self.connections_in_use:
-                raise PoolError("Connection not in use in pool")
+                msg = "Connection not in use in pool"
+                raise PoolError(msg)
             self.connections_in_use.discard(conn)
 
         # cancel the current command, if one is running
@@ -384,7 +417,6 @@ class ConnectionPool:
                 conn.cancel()
 
         # Determine if the connection should be kept or discarded.
-        # close_surplus_connections_immediately = self.idle_timeout == 0
         if self.idle_timeout == 0 and len(self.connection_queue) >= self.minconn:
             conn.close()
         else:
@@ -400,15 +432,13 @@ class ConnectionPool:
                         # The connection is still in a transaction, roll it back.
                         conn.rollback()
                     self._checkin_connection(conn)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     #  rollback failed, discard it
                     logger.info("Rollback of connection failed, closing it.")
                     self._safely_close_connection(conn)
 
     def reap_idle_connections(self: Self) -> None:
-        """Close and discard idle connections in the pool that breached their
-        idle timeout.
-        """
+        """Close and discard idle connections in the pool that breached their idle timeout."""
         if self.idle_timeout == 0:
             logger.warning("reap_idle_connections should not be called if idle_timeout is zero")
             return
@@ -420,12 +450,12 @@ class ConnectionPool:
             if not self._reap_connection_idle_too_long():
                 # nothing in the pool
                 break
-            close_count+=1
-    
+            close_count += 1
+
         logger.info("Closed %s connections", close_count)
 
         # create any connections necessary
-        self.prewarm()
+        self._prewarm()
 
     def _close_if_expired(self: Self, conn: connection) -> bool:
         try:
@@ -442,9 +472,9 @@ class ConnectionPool:
             logger.exception("Couldn't close connection")
         return False
 
-    def clear(self: Self):
-        """Close and discard all idle connections in the pool (regardless of the
-        values of :attr:`.minconn` and :attr:`.idle_timeout`).
+    def discard_all_idle(self: Self) -> None:
+        """
+        Close and discard all idle connections in the pool.
 
         This method could be useful if you have periods of high activity that
         result in many connections being opened, followed by prolonged periods

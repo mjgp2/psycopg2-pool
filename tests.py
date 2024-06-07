@@ -1,34 +1,42 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+import contextlib
 from socket import gaierror
 from time import monotonic, sleep
 from unittest import TestCase
 
 import psycopg2
-from psycopg2.errors import ProgrammingError
 import psycopg2.extensions as _ext
-
-from psycopg2_pool import ConnectionPool, PoolError, PoolStats
+import pytest
+from psycopg2.errors import ProgrammingError
+from psycopg2_pool2 import ConnectionPool, PoolError, PoolStats
 
 
 class PoolTests(TestCase):
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
-        assert pool.connect_kwargs['connect_timeout'] == 5
-        assert pool.connect_kwargs['dsn'] == ''
+        assert pool.connect_kwargs["connect_timeout"] == 5
+        assert pool.connect_kwargs["dsn"] == ""
 
-    def test_hostname(self):
+    def test_hostname(self) -> None:
 
-        assert ConnectionPool(0, 1, reap_idle_interval=0, host = 'localhost').hostname == 'localhost'
-        assert ConnectionPool(0, 1, reap_idle_interval=0, host = 'localhost', hostaddr='127.0.0.1').hostname is None
-        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'postgresql://test_user:password@localhost/test').hostname == 'localhost'
-        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'postgresql://test_user:password@127.0.0.1/test').hostname is None
-        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'user=test_user password=password dbname=test host=localhost port=5434 connect_timeout=5 hostaddr=127.0.0.1').hostname is None
-        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn = 'user=test_user password=password dbname=test host=localhost port=5434 connect_timeout=5').hostname == 'localhost'
+        assert ConnectionPool(0, 1, reap_idle_interval=0, host="localhost").hostname == "localhost"
+        assert ConnectionPool(0, 1, reap_idle_interval=0, host="localhost", hostaddr="127.0.0.1").hostname is None
+        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn="postgresql://test_user:password@localhost/test").hostname == "localhost"
+        assert ConnectionPool(0, 1, reap_idle_interval=0, dsn="postgresql://test_user:password@127.0.0.1/test").hostname is None
+        assert ConnectionPool(
+            0,
+            1,
+            reap_idle_interval=0,
+            dsn="user=test_user password=password dbname=test host=localhost port=5434 connect_timeout=5 hostaddr=127.0.0.1",
+        ).hostname is None
+        assert ConnectionPool(
+            0,
+            1,
+            reap_idle_interval=0,
+            dsn="user=test_user password=password dbname=test host=localhost port=5434 connect_timeout=5",
+        ).hostname == "localhost"
 
-
-    def test_getconn(self):
+    def test_getconn(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
 
         conn = pool.getconn()
@@ -39,7 +47,7 @@ class PoolTests(TestCase):
         assert pool.stats() == PoolStats(1, 0)
 
         # Try again. We should get an error, since we only allowed one connection.
-        with self.assertRaises(PoolError):
+        with pytest.raises(PoolError):
             pool.getconn()
 
         # Put the connection back, the return time should be saved
@@ -54,16 +62,16 @@ class PoolTests(TestCase):
         assert new_conn is conn
         assert len(pool.connection_queue) == 0
 
-    def test_putconn(self):
+    def test_putconn(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
         conn = pool.getconn()
         assert len(pool.connection_queue) == 0
 
         pool.putconn(conn)
-        with self.assertRaises(PoolError):
+        with pytest.raises(PoolError):
             pool.putconn(conn)
 
-    def test_putconn_twice(self):
+    def test_putconn_twice(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
         conn = pool.getconn()
         assert len(pool.connection_queue) == 0
@@ -74,7 +82,7 @@ class PoolTests(TestCase):
         assert conn is pool.connection_queue[0][0]
         assert now < pool.connection_queue[0][1]
 
-    def test_putconn_with_close_connection(self):
+    def test_putconn_with_close_connection(self) -> None:
         pool = ConnectionPool(0, 1, idle_timeout=0, reap_idle_interval=0)
         conn = pool.getconn()
         assert len(pool.connection_queue) == 0
@@ -84,7 +92,7 @@ class PoolTests(TestCase):
         pool.putconn(conn)
         assert len(pool.connection_queue) == 0
 
-    def test_putconn_with_expired_connection(self):
+    def test_putconn_with_expired_connection(self) -> None:
         pool = ConnectionPool(0, 1, idle_timeout=60, lifetime_timeout=0, reap_idle_interval=0)
         conn = pool.getconn()
         assert len(pool.connection_queue) == 0
@@ -94,7 +102,7 @@ class PoolTests(TestCase):
 
         assert len(pool.connection_queue) == 0
 
-    def test_getconn_closed_no_test_on_borrow(self):
+    def test_getconn_closed_no_test_on_borrow(self) -> None:
         pool = ConnectionPool(0, 1, test_on_borrow=False, reap_idle_interval=0)
         conn = pool.getconn()
         pool.putconn(conn)
@@ -106,7 +114,7 @@ class PoolTests(TestCase):
         new_conn = pool.getconn()
         assert new_conn is not conn
 
-    def test_getconn_closed(self):
+    def test_getconn_closed(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
         conn = pool.getconn()
         now = monotonic()
@@ -122,7 +130,7 @@ class PoolTests(TestCase):
         new_conn = pool.getconn()
         assert new_conn is not conn
 
-    def test_reap_idle_connections(self):
+    def test_reap_idle_connections(self) -> None:
         pool = ConnectionPool(0, 10, idle_timeout=30, reap_idle_interval=0)
         conn = pool.getconn()
         conn2 = pool.getconn()
@@ -135,25 +143,22 @@ class PoolTests(TestCase):
         assert conn is pool.connection_queue[0][0]
 
         pool.connection_queue[0] = (pool.connection_queue[0][0], pool.connection_queue[0][1] - 60)
-        print(pool.stats() )
         pool.reap_idle_connections()
-        print(pool.stats() )
         assert pool.stats() == PoolStats(0, 1)
 
         # Connection should be discarded
         new_conn = pool.getconn()
         assert new_conn is not conn
 
-
         # simulate race condition
         assert len(pool.connection_queue) == 0
 
-        # make sure reaping keeps the minimum number of connections in the pool 
+        # make sure reaping keeps the minimum number of connections in the pool
         pool.minconn = 2
         pool.reap_idle_connections()
         assert pool.stats() == PoolStats(1, 1)
 
-    def test_reap_idle_connections_auto(self):
+    def test_reap_idle_connections_auto(self) -> None:
         pool = ConnectionPool(0, 1, idle_timeout=30, reap_idle_interval=0.1)
         conn = pool.getconn()
 
@@ -173,16 +178,14 @@ class PoolTests(TestCase):
 
         pool.shutdown()
 
-    def test_putconn_errorState(self):
+    def test_putconn_errorState(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
         conn = pool.getconn()
 
         # Get connection into transaction state
         cursor = conn.cursor()
-        try:
+        with contextlib.suppress(ProgrammingError):
             cursor.execute("INSERT INTO nonexistent (id) VALUES (1)")
-        except ProgrammingError:
-            pass
 
         assert conn.get_transaction_status() != _ext.TRANSACTION_STATUS_IDLE
 
@@ -192,7 +195,7 @@ class PoolTests(TestCase):
         assert conn.get_transaction_status() == _ext.TRANSACTION_STATUS_IDLE
         assert conn is pool.connection_queue[0][0]
 
-    def test_putconn_closed(self):
+    def test_putconn_closed(self) -> None:
         pool = ConnectionPool(0, 1, reap_idle_interval=0)
         conn = pool.getconn()
 
@@ -208,7 +211,7 @@ class PoolTests(TestCase):
 
         assert len(pool.connection_queue) == 0
 
-    def test_caching(self):
+    def test_caching(self) -> None:
         pool = ConnectionPool(0, 10, reap_idle_interval=0)
 
         # Get a connection to use to check the number of connections
@@ -260,7 +263,7 @@ class PoolTests(TestCase):
 
         assert total_cons_after_get == total_cons
 
-    def test_clear(self):
+    def test_clear(self) -> None:
         pool = ConnectionPool(0, 10, reap_idle_interval=0)
         conn1 = pool.getconn()
         conn2 = pool.getconn()
@@ -273,7 +276,7 @@ class PoolTests(TestCase):
         assert not conn2.closed
         assert not conn3.closed
 
-        pool.clear()
+        pool.discard_all_idle()
 
         assert not conn1.closed
         assert not conn2.closed
@@ -281,54 +284,54 @@ class PoolTests(TestCase):
         assert len(pool.connection_queue) == 0
         assert pool.stats() == PoolStats(2, 0)
 
-    def test_close_if_expired_error(self):
+    def test_close_if_expired_error(self) -> None:
         pool = ConnectionPool(0, 10, reap_idle_interval=0)
-        assert not pool._close_if_expired(('not a connection',))  # type: ignore
+        assert not pool._close_if_expired(("not a connection", ))  # type: ignore
 
-    def test_close_if_expired_missing_from_map(self):
+    def test_close_if_expired_missing_from_map(self) -> None:
         pool = ConnectionPool(0, 10, reap_idle_interval=0)
         conn = psycopg2.connect()
         assert not pool._close_if_expired(conn)  # type: ignore
         assert conn.closed
 
-    def test_host_random_resolution(self):
+    def test_host_random_resolution(self) -> None:
         pool = ConnectionPool(0, 1, host="localhost", reap_idle_interval=0)
         pool.getconn()
 
-    def test_host_random_resolution_failure(self):
+    def test_host_random_resolution_failure(self) -> None:
         pool = ConnectionPool(0, 1, host="jsdfgjhsdfkhsdk.foo", reap_idle_interval=0)
         # Try again. We should get an error, since we only allowed one connection.
-        with self.assertRaises(gaierror):
+        with pytest.raises(gaierror):
             pool.getconn()
 
-    def test_connect_timeout(self):
+    def test_connect_timeout(self) -> None:
         pool = ConnectionPool(0, 1, host="bing.com", connect_timeout=0.2, reap_idle_interval=0)
         # Try again. We should get an error, since we only allowed one connection.
-        with self.assertRaises(psycopg2.OperationalError):
+        with pytest.raises(psycopg2.OperationalError):
             pool.getconn()
 
-    def test_host_ip_address(self):
-        pool = ConnectionPool(0, 1, host='127.0.0.1', reap_idle_interval=0)
+    def test_host_ip_address(self) -> None:
+        pool = ConnectionPool(0, 1, host="127.0.0.1", reap_idle_interval=0)
         pool.getconn()
 
-    def test_prewarm(self):
+    def test_prewarm(self) -> None:
         pool = ConnectionPool(1, 1, background_prewarm=False, reap_idle_interval=0)
         assert pool.stats().idle == 1
         assert pool.prewarmed
 
-    def test_prewarm_background(self):
+    def test_prewarm_background(self) -> None:
         pool = ConnectionPool(5, 10, reap_idle_interval=0)
         assert not pool.prewarmed
-        for _ in range(0,100):
+        for _ in range(100):
             sleep(0.1)
             if pool.stats().idle == 5:
                 assert pool.prewarmed
                 return
-        raise Exception("Prewarm failed")
+        msg = "Prewarm failed"
+        raise Exception(msg)
 
-    def test_shutdown(self):
+    def test_shutdown(self) -> None:
         pool = ConnectionPool(5, 10, reap_idle_interval=0)
         assert not pool._shutdown
         pool.shutdown()
         assert pool._shutdown
-

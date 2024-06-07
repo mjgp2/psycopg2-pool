@@ -1,0 +1,35 @@
+repos:
+-   repo: local
+    hooks:
+    -   id: yapf
+        name: yapf
+        stages: [commit]
+        language: system
+        entry: poetry run ./scripts/format.sh
+        pass_filenames: true
+        types: [python]
+    -   id: ruff
+        name: ruff
+        stages: [commit]
+        language: system
+        entry: poetry run ruff check .
+        pass_filenames: false
+        types: [python]
+    -   id: mypy
+        name: mypy
+        stages: [commit]
+        language: system
+        entry: poetry run mypy .
+        pass_filenames: false
+    -   id: pytest
+        name: pytest
+        stages: [commit]
+        language: system
+        entry: poetry run pytest tests.py
+        pass_filenames: false
+    -   id: poetry
+        name: poetry
+        stages: [commit]
+        language: system
+        entry: poetry lock --check
+        pass_filenames: false
