@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "psycopg2_pool2"
-version = "1.0.0"
+version = "1.0.1"
 description = "Enterprise pooling of psycopg2 connections"
 authors = ["Matthew Painter", "Changaco"]
 maintainers = ["Matthew Painter"]

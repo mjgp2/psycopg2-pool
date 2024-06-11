@@ -7,7 +7,7 @@ import psycopg2
 import psycopg2.extensions as _ext
 import pytest
 from psycopg2.errors import ProgrammingError
-from psycopg2_pool2 import ConnectionPool, PoolError, PoolStats
+from psycopg2_pool2 import ConnectionPool, PoolError, PoolStats, _pools
 
 
 class PoolTests(TestCase):
@@ -331,7 +331,34 @@ class PoolTests(TestCase):
         raise Exception(msg)
 
     def test_shutdown(self) -> None:
-        pool = ConnectionPool(5, 10, reap_idle_interval=0)
+        pool = ConnectionPool(1, 10, reap_idle_interval=0)
         assert not pool._shutdown
+        assert pool in _pools
+
+        conn1 = pool.getconn()
+        conn2 = pool.getconn()
+        conn3 = pool.getconn()
+        pool.putconn(conn3)
+
+        assert len(pool.connection_queue) == 1
+        assert pool.stats() == PoolStats(2, 1)
+        assert not conn1.closed
+        assert not conn2.closed
+        assert not conn3.closed
+
         pool.shutdown()
         assert pool._shutdown
+        assert pool not in _pools
+
+        assert not conn1.closed
+        assert not conn2.closed
+        assert conn3.closed
+        assert len(pool.connection_queue) == 0
+        assert pool.stats() == PoolStats(2, 0)
+
+        with pytest.raises(PoolError):
+            pool.getconn()
+
+        pool.putconn(conn1)
+        pool.putconn(conn2)
+        assert pool.stats() == PoolStats(0, 0)

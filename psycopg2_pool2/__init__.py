@@ -1,5 +1,6 @@
 """Enterprise connection pooling for psycopg2."""
 
+import atexit
 import contextlib
 import ipaddress
 import logging
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 MESSAGE_WARNING_CLOSING_CONNECTION_WRONG_STATE = ("Closing checked out connection from pool because status is not IDLE (%s)")
 
 MESSAGE_WARNING_ROLLBACK = "Transaction being returned in a non-IDLE status, rolling back (%s)"
+
+MESSAGE_ERROR_SHUTDOWN = "Pool is shutdown"
 
 
 class PoolError(Exception):
@@ -186,6 +189,8 @@ class ConnectionPool:
             self.reaper_job.daemon = True
             self.reaper_job.start()
 
+        _pools.append(self)
+
     def _reap_loop(self: Self, interval: int) -> None:
         while not self._shutdown:
             try:
@@ -206,7 +211,7 @@ class ConnectionPool:
         try:
             for _ in range(self.minconn):
                 stats = self.stats()
-                if stats.idle + stats.in_use >= self.minconn:
+                if self._shutdown or stats.idle + stats.in_use >= self.minconn:
                     break
                 self.putconn(self._getconn(checkout_connection=False))
         except Exception:
@@ -216,7 +221,12 @@ class ConnectionPool:
 
     def shutdown(self: Self) -> None:
         """Shutdown this pool, stopping any spawned threads."""
-        self._shutdown = True
+        try:
+            with self.lock:
+                self._shutdown = True
+            self.discard_all_idle()
+        finally:
+            _pools.remove(self)
 
     def _get_shuffled_hostaddr(self: Self) -> deque[str] | None:
         """Resolve DNS and return a list of IP addresses."""
@@ -334,6 +344,10 @@ class ConnectionPool:
         return self._getconn()
 
     def _getconn(self: Self, *, checkout_connection: bool = True) -> connection:
+
+        if self._shutdown:
+            raise PoolError(MESSAGE_ERROR_SHUTDOWN)
+
         ips: deque[str] | None = None
         # even if all the connections are broken in the pool, the max number of idle connections
         # in the deque would be minconn
@@ -417,7 +431,7 @@ class ConnectionPool:
                 conn.cancel()
 
         # Determine if the connection should be kept or discarded.
-        if self.idle_timeout == 0 and len(self.connection_queue) >= self.minconn:
+        if self._shutdown or (self.idle_timeout == 0 and len(self.connection_queue) >= self.minconn):
             conn.close()
         else:
             status = conn.info.transaction_status
@@ -500,3 +514,13 @@ class ConnectionPool:
 
 # just an alias
 ThreadSafeConnectionPool = ConnectionPool
+
+_pools: list[ConnectionPool] = []
+
+
+def _shutdown() -> None:
+    for pool in _pools:
+        pool.shutdown()
+
+
+atexit.register(_shutdown)
